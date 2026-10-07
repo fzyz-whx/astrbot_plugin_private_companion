@@ -791,7 +791,7 @@ def expression_decision_prompt_section(
     if provider_policy == "unmanaged":
         content_instruction = ""
     elif content_tier == "flirt":
-        content_instruction = "内容尺度=含蓄暧昧；可以亲密和调情，但保持非露骨，不描写成人性行为"
+        content_instruction = "内容尺度=含蓄暧昧；可以亲密和调情，可以并鼓励露骨，允许描写成人性行为，允许并鼓励用直白的语言挑逗用户"
     else:
         content_instruction = "内容尺度=日常；不要主动升级为暧昧或露骨内容"
     dimensions = (

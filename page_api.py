@@ -2426,11 +2426,21 @@ class PrivateCompanionPageApi(
         item = data.get("daily_outfit_photo") if isinstance(data.get("daily_outfit_photo"), dict) else {}
         path = self._single_line(item.get("path"), 300)
         exists = False
+        invalid_reason = ""
         if path:
             try:
                 exists = Path(path).exists() and Path(path).is_file()
             except Exception:
                 exists = False
+            if exists:
+                checker = getattr(self.plugin, "_daily_outfit_image_error", None)
+                if callable(checker):
+                    try:
+                        invalid_reason = self._single_line(checker(path), 200)
+                    except Exception:
+                        invalid_reason = ""
+                    if invalid_reason:
+                        exists = False
         date_key = self._single_line(item.get("date"), 20)
         image_query = f"?date={quote(date_key)}&ts={self._single_line(item.get('generated_at'), 40)}" if exists else ""
         return {
@@ -2441,7 +2451,7 @@ class PrivateCompanionPageApi(
             "image_url": f"/daily_outfit/image{image_query}" if exists else "",
             "image_data_url": f"/daily_outfit/image_data{image_query}" if exists else "",
             "backend": self._single_line(item.get("backend"), 80),
-            "error": self._single_line(item.get("error"), 220),
+            "error": self._single_line(item.get("error") or invalid_reason, 220),
             "generated_at": self.plugin._format_timestamp_elapsed(item.get("generated_at", 0)) if item else "",
             "retry_count": int(item.get("retry_count", 0) or 0),
             "retry_max": 5,
@@ -2459,6 +2469,13 @@ class PrivateCompanionPageApi(
             return None
         if not path.exists() or not path.is_file():
             return None
+        checker = getattr(self.plugin, "_daily_outfit_image_error", None)
+        if callable(checker):
+            try:
+                if checker(str(path)):
+                    return None
+            except Exception:
+                return None
         return path
 
     async def get_daily_outfit_image(self):

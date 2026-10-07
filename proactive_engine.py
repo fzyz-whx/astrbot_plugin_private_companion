@@ -7799,10 +7799,7 @@ class ProactiveEngineMixin:
             if not text or created_at <= 0:
                 continue
             age = check_now - created_at
-            if age < 4 * 3600 or age > 14 * 86400:
-                continue
-            last_candidate_at = _safe_float(item.get("proactive_candidate_at"), 0)
-            if last_candidate_at > 0 and check_now - last_candidate_at < 36 * 3600:
+            if age < 4 * 3600 or age > 7 * 86400:
                 continue
             score_getter = getattr(self, "_open_loop_relevance_score", None)
             score = _safe_float(score_getter(item) if callable(score_getter) else 0.5, 0.5)
@@ -7817,7 +7814,11 @@ class ProactiveEngineMixin:
             if callable(sampler)
             else check_now + random.uniform(15 * 60, 2 * 3600)
         )
-        selected["proactive_candidate_at"] = check_now
+        # 每个未完话头只允许被主动提起一次：选中即从 open_loops 中移除，不再回催
+        loops_list = user.get("open_loops")
+        if isinstance(loops_list, list) and selected in loops_list:
+            loops_list.remove(selected)
+            user["open_loops"] = loops_list
         anonymous_pending = user.get("mobile_anonymous_area_pending")
         anonymous_linked = (
             isinstance(anonymous_pending, dict)

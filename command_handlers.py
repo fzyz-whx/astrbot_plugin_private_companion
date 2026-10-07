@@ -3494,8 +3494,16 @@ class CommandHandlersMixin:
                 suffix += f"\n上次失败原因：{error}"
             return "今天还没有新的每日穿搭图。" + suffix + "\n管理员可以手动用：陪伴 生成穿搭。", ""
         path_text = _path_text(item.get("path"), 1000)
-        if not path_text:
-            reason = error or note or "没有可用图片路径"
+        image_error = ""
+        if path_text:
+            checker = getattr(self, "_daily_outfit_image_error", None)
+            if callable(checker):
+                try:
+                    image_error = _single_line(checker(path_text), 160)
+                except Exception:
+                    image_error = ""
+        if not path_text or image_error:
+            reason = error or image_error or note or "没有可用图片路径"
             retry_count = int(item.get("retry_count", 0) or 0)
             retry_max = 5
             if retry_count > 0 and retry_count < retry_max:
@@ -4868,6 +4876,20 @@ class CommandHandlersMixin:
                 ),
             )
         )
+        # Persona-scoped "fixed additional prompt" for this workflow kind. The
+        # builder returns (None, {}) when the setting is empty, and the whole
+        # lookup is guarded so an older or newer plugin layout that lacks the
+        # builder simply keeps the previous behaviour.
+        try:
+            fixed_builder = getattr(
+                self, "_photo_generation_workflow_fixed_prompt_section", None
+            )
+            if callable(fixed_builder):
+                fixed_section, _fixed_audit = fixed_builder(kind)
+                if fixed_section is not None:
+                    sections.append(fixed_section)
+        except Exception as exc:
+            logger.debug("附加固定提示词读取失败，已跳过: %s", _single_line(exc, 160))
         if kind == "selfie":
             sections.append(
                 prompt_section(

@@ -11051,6 +11051,78 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         )
         return not any(token in text for token in skip_tokens)
 
+    # 每日穿搭自动生成的最早本地小时；到点前只保留旧记录，不发起生成。
+    _DAILY_OUTFIT_AUTO_HOUR = 6
+    # 生成失败（含上游返回错误占位图）时的自动重试上限与间隔。
+    _DAILY_OUTFIT_RETRY_MAX = 5
+    _DAILY_OUTFIT_RETRY_BACKOFF_SECONDS = 180.0
+
+    @classmethod
+    def _daily_outfit_generation_time_reached(cls, now_ts: float | None = None) -> bool:
+        check_ts = _now_ts() if now_ts is None else now_ts
+        try:
+            hour = datetime.fromtimestamp(check_ts).hour
+        except (OSError, OverflowError, ValueError):
+            return True
+        return hour >= int(getattr(cls, "_DAILY_OUTFIT_AUTO_HOUR", 6) or 0)
+
+    @staticmethod
+    def _daily_outfit_image_error(path_text: Any) -> str:
+        """穿搭图文件可用时返回空串，否则返回不可用原因（含上游错误占位图）。"""
+        text = _path_text(path_text, 1000)
+        if not text:
+            return "没有图片路径"
+        try:
+            path = Path(text).expanduser()
+            if not path.is_absolute():
+                path = Path(text)
+            path = path.resolve()
+        except Exception:
+            return "图片路径无效"
+        try:
+            if not path.exists() or not path.is_file():
+                return "图片文件不存在"
+            size = path.stat().st_size
+            with path.open("rb") as fh:
+                head = fh.read(64)
+        except OSError:
+            return "图片文件不可读"
+        if size <= 0:
+            return "图片文件为空"
+        stripped = head.lstrip().lower()
+        if stripped.startswith((b"<?xml", b"<svg")):
+            return "生成结果是错误占位图而不是图片"
+        if stripped.startswith((b"<!doctype", b"<html")):
+            return "生成结果是网页而不是图片"
+        if (
+            head.startswith(b"\x89PNG\r\n\x1a\n")
+            or head.startswith(b"\xff\xd8\xff")
+            or head.startswith((b"GIF87a", b"GIF89a"))
+        ):
+            return ""
+        if head.startswith(b"RIFF") and len(head) >= 12 and head[8:12] == b"WEBP":
+            return ""
+        if size < 1024:
+            return f"图片文件过小（{size} 字节），疑似错误占位图"
+        return ""
+
+    def _daily_outfit_should_skip_existing(self, existing: Any, today: str, now_ts: float) -> bool:
+        """今天已有可用穿搭图（或达到重试上限/仍在退避间隔）时返回 True。"""
+        if not isinstance(existing, dict) or not existing:
+            return False
+        if _single_line(existing.get("date"), 20) != today:
+            return False
+        record_error = _single_line(existing.get("error"), 240)
+        if not record_error and not self._daily_outfit_image_error(existing.get("path")):
+            return True
+        retry_count = _safe_int(existing.get("retry_count"), 0, 0, 100)
+        if retry_count >= int(self._DAILY_OUTFIT_RETRY_MAX):
+            return True
+        generated_at = _safe_float(existing.get("generated_at"), 0.0, 0.0)
+        if generated_at > 0 and now_ts - generated_at < float(self._DAILY_OUTFIT_RETRY_BACKOFF_SECONDS):
+            return True
+        return False
+
     async def _ensure_daily_outfit_photo(
         self,
         diary: dict[str, Any] | None = None,
@@ -11060,9 +11132,18 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         if not force and not runtime_persona_setting(self, "enable_daily_outfit_photo", False):
             return None
         today = _today_key()
+        now_ts = _now_ts()
+        if not force and not self._daily_outfit_generation_time_reached(now_ts):
+            logger.debug(
+                "每日穿搭未到自动生成时间(%02d:00),本次跳过",
+                int(self._DAILY_OUTFIT_AUTO_HOUR),
+            )
+            async with self._data_lock:
+                existing = self.data.get("daily_outfit_photo") if isinstance(self.data.get("daily_outfit_photo"), dict) else {}
+                return dict(existing) if existing else None
         async with self._data_lock:
             existing = self.data.get("daily_outfit_photo") if isinstance(self.data.get("daily_outfit_photo"), dict) else {}
-            if not force and existing.get("date") == today:
+            if not force and self._daily_outfit_should_skip_existing(existing, today, now_ts):
                 return dict(existing)
         lock = getattr(self, "_daily_outfit_photo_generation_lock", None)
         if lock is None:
@@ -11071,7 +11152,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         async with lock:
             async with self._data_lock:
                 existing = self.data.get("daily_outfit_photo") if isinstance(self.data.get("daily_outfit_photo"), dict) else {}
-                if not force and existing.get("date") == today:
+                if not force and self._daily_outfit_should_skip_existing(existing, today, now_ts):
                     return dict(existing)
             return await self._ensure_daily_outfit_photo_unlocked(diary, force=force, today=today)
 
@@ -11127,11 +11208,28 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             prompt_text=prompt_text,
             request_text=prompt_text,
             session_key="daily_outfit",
-            image_size="1024x1024",
+            image_size="1024x1536",
             allow_daily_outfit_reference=False,
             prompt_sections=prompt_sections,
         )
         if image_path:
+            image_error = self._daily_outfit_image_error(image_path)
+            if image_error:
+                logger.warning(
+                    "每日穿搭生成结果校验失败: %s path=%s",
+                    image_error,
+                    _single_line(image_path, 160),
+                )
+                return await self._record_daily_outfit_photo_result(
+                    today,
+                    "",
+                    f"生成结果不可用：{image_error}",
+                    backend=backend_name,
+                    prompt=prompt_text,
+                    note=note,
+                    outfit_profile=outfit_profile,
+                    reset_retry=force,
+                )
             return await self._record_daily_outfit_photo_result(
                 today,
                 image_path,
@@ -11140,6 +11238,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
                 prompt=prompt_text,
                 note=note,
                 outfit_profile=outfit_profile,
+                reset_retry=force,
             )
         return await self._record_daily_outfit_photo_result(
             today,
@@ -11149,6 +11248,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             prompt=prompt_text,
             note=note,
             outfit_profile=outfit_profile,
+            reset_retry=force,
         )
 
     async def _record_daily_outfit_photo_result(
@@ -11161,6 +11261,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         prompt: str = "",
         note: str = "",
         outfit_profile: dict[str, Any] | None = None,
+        reset_retry: bool = False,
     ) -> dict[str, Any]:
         item = {
             "date": _single_line(date_key, 20),
@@ -11173,6 +11274,18 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             "outfit_profile": self._normalize_daily_outfit_profile(outfit_profile),
         }
         async with self._data_lock:
+            previous = self.data.get("daily_outfit_photo") if isinstance(self.data.get("daily_outfit_photo"), dict) else {}
+            if image_path:
+                item["retry_count"] = 0
+            else:
+                prev_count = 0
+                if (
+                    not reset_retry
+                    and isinstance(previous, dict)
+                    and _single_line(previous.get("date"), 20) == item["date"]
+                ):
+                    prev_count = _safe_int(previous.get("retry_count"), 0, 0, 100)
+                item["retry_count"] = prev_count + 1
             history = self._daily_outfit_history_items(include_current=True)
             if image_path:
                 history.insert(0, dict(item))
@@ -11189,7 +11302,11 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
                 _single_line(image_path, 160),
             )
         else:
-            logger.info("每日穿搭照片未生成: %s", _single_line(error or note, 180))
+            logger.info(
+                "每日穿搭照片未生成(连续第%s次): %s",
+                item.get("retry_count", 0),
+                _single_line(error or note, 180),
+            )
         return item
 
     def _daily_outfit_schedule_text(self) -> str:
@@ -11592,7 +11709,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             )
             + "."
         )
-        return _single_line(prompt, 1400)
+        return _single_line(prompt, 6000)
 
     def _build_daily_outfit_photo_prompt_sections(
         self,
@@ -11646,9 +11763,10 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             ]
             if anime_style
             else [
-                "daily outfit selfie",
-                "selfie outfit photo",
-                "non-mirror handheld selfie or natural environmental outfit portrait",
+                "daily outfit photo",
+                "outfit showcase photo",
+                "full-length mirror selfie or full-body photo taken by another person",
+                "whole body in frame",
                 "natural phone snapshot",
                 "soft natural light",
                 "clean background",
@@ -11663,10 +11781,8 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             "complete head and hair",
             "clear eyes",
             "natural expression",
-            "upper body to three-quarter body portrait, not a full-length mirror shot",
+            "full-body shot",
             "centered composition",
-            "1:1 square cover composition",
-            "safe margins around head and body",
             *composition_style[3:],
             persona or "keep the face, hairstyle, hair color, eye color, and key traits consistent with the reference image",
             outfit_hint,
@@ -13968,7 +14084,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             "镜前穿搭": (
                 "explicitly requested mirror outfit photo, half-body to three-quarter mirror composition, "
                 "clear clothes, jacket, accessories and color palette, complete visible face, no phone covering face, "
-                "subject inside square safe area, not full-length body-only, not outfit-only, not clothing close-up"
+                "subject inside vertical portrait safe area, not outfit-only, not clothing close-up"
             ),
             "头像特写": (
                 "avatar-ready face close-up, clear hair, eyes and expression, clean background, centered face, enough margin, "

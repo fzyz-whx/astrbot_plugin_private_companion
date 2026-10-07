@@ -4376,7 +4376,7 @@ class UserMemoryMixin:
             if not isinstance(item, dict):
                 continue
             created_ts = self._open_loop_created_ts(item, now)
-            if created_ts > 0 and now - created_ts > 14 * 86400:
+            if created_ts > 0 and now - created_ts > 7 * 86400:
                 continue
             if not _safe_float(item.get("created_ts"), 0):
                 item["created_ts"] = created_ts
@@ -8828,7 +8828,7 @@ Character-specific bottom-line baseline (reference only; empty means use the con
                     key="background.memory.response_review.content_tier",
                     title="统一内容尺度",
                     source="user_memory",
-                    content=f"{content_tier}；normal 不主动升级，flirt 只允许非露骨暧昧。",
+                    content=f"{content_tier}；normal 不主动升级，flirt 允许露骨暧昧。",
                 )
             )
             if content_policy_enabled
